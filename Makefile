@@ -13,6 +13,11 @@ TWEAK_NAME = SBTweaker
 SBTweaker_FILES = Tweak.x
 SBTweaker_CFLAGS = -fobjc-arc
 
+# Diagnostic builds only: make SBT_DIAG=1 adds Diag.x (logging, never released).
+ifeq ($(SBT_DIAG),1)
+SBTweaker_FILES += Diag.x
+endif
+
 ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
 SBTweaker_LIBRARIES += roothide
 endif

@@ -791,6 +791,96 @@ static void sbc_install_landscape_hooks(void) {
 %end
 %end
 
+// ---------------------------------------- iOS 18: Home Screen page capacity
+//
+// SBTweaker's view hooks show the custom rows/columns, but each Home Screen
+// page's list model keeps the grid it was created with — stock 4x6. iOS 18's
+// free placement and the page capacity work against that model grid, so a
+// page counted as full at 24 cells: icons could not be dropped into the
+// visible extra rows, and a widget could not move down into an empty row.
+//
+// SpringBoard asks the icon manager (and the icon model, while unarchiving
+// the icon state) for the list grid size when it builds a folder's pages.
+// Answering with the custom grid for the root folder makes the pages be
+// created with it, so capacity, gaps and widget placement all agree with
+// what is shown. Pages are built at launch, so this takes a respring.
+// Overriding the model's gridSize getter afterwards (the earlier widget test
+// builds) is not enough: the model keeps its stored grid.
+
+static BOOL sbc_is_ios18_or_newer(void) {
+    static BOOL result;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        result = [NSProcessInfo processInfo].operatingSystemVersion.majorVersion >= 18;
+    });
+    return result;
+}
+
+static SBCGridSize sbc_root_list_grid(Class folderClass, SBCGridSize original, const char *source) {
+    if (!sbc_is_ios18_or_newer() || !folderClass) return original;
+    // Empty means "no special grid" (e.g. the widget-page variant on iPhone);
+    // keep it empty so SpringBoard's early-outs stay intact.
+    if (!original.columns || !original.rows) return original;
+    Class rootFolderClass = objc_getClass("SBRootFolder");
+    if (!rootFolderClass || ![folderClass isSubclassOfClass:rootFolderClass]) return original;
+    NSDictionary *p = sbc_prefs();
+    if (!prefBool(p, @"enabled") || !prefBool(p, @"homeGridEnabled")) return original;
+    SBCGridSize grid = {
+        (unsigned short)clampi((int)prefInt(p, @"hsCols"), 1, 10),
+        (unsigned short)clampi((int)prefInt(p, @"hsRows"), 1, 10)
+    };
+    static uint32_t lastLogged = 0;
+    uint32_t sig = ((uint32_t)grid.columns << 16) | grid.rows;
+    if (sig != lastLogged) {
+        lastLogged = sig;
+        NSLog(@"[SBC:I18] %s root list grid %ux%u (stock %ux%u)", source,
+              grid.columns, grid.rows, original.columns, original.rows);
+    }
+    return grid;
+}
+
+// Installed manually: only where the method exists and returns the
+// two-unsigned-short grid struct, so a differently shaped SpringBoard is left
+// alone instead of crashing.
+static SBCGridSize (*sbc_orig_mgr_list_grid)(id, SEL, Class) = NULL;
+static SBCGridSize (*sbc_orig_mgr_widget_list_grid)(id, SEL, Class) = NULL;
+static SBCGridSize (*sbc_orig_model_list_grid)(id, SEL, Class) = NULL;
+
+static SBCGridSize sbc_mgr_list_grid(id self, SEL _cmd, Class folderClass) {
+    return sbc_root_list_grid(folderClass, sbc_orig_mgr_list_grid(self, _cmd, folderClass), "manager");
+}
+static SBCGridSize sbc_mgr_widget_list_grid(id self, SEL _cmd, Class folderClass) {
+    return sbc_root_list_grid(folderClass, sbc_orig_mgr_widget_list_grid(self, _cmd, folderClass), "manager-widgets");
+}
+static SBCGridSize sbc_model_list_grid(id self, SEL _cmd, Class folderClass) {
+    return sbc_root_list_grid(folderClass, sbc_orig_model_list_grid(self, _cmd, folderClass), "model");
+}
+
+static void sbc_hook_grid_getter(const char *className, const char *selName, IMP replacement, IMP *original) {
+    Class cls = objc_getClass(className);
+    SEL sel = sel_registerName(selName);
+    Method m = cls ? class_getInstanceMethod(cls, sel) : NULL;
+    if (!m) { NSLog(@"[SBC:I18] -[%s %s] missing", className, selName); return; }
+    char ret[64] = {0}, arg[16] = {0};
+    method_getReturnType(m, ret, sizeof ret);
+    method_getArgumentType(m, 2, arg, sizeof arg);
+    if (!strstr(ret, "=SS}") || arg[0] != '#' || method_getNumberOfArguments(m) != 3) {
+        NSLog(@"[SBC:I18] -[%s %s] unexpected signature %s", className, selName, method_getTypeEncoding(m));
+        return;
+    }
+    MSHookMessageEx(cls, sel, replacement, original);
+}
+
+static void sbc_install_ios18_grid_hooks(void) {
+    if (!sbc_is_ios18_or_newer()) return;
+    sbc_hook_grid_getter("SBHIconManager", "listGridSizeForFolderClass:",
+                         (IMP)sbc_mgr_list_grid, (IMP *)&sbc_orig_mgr_list_grid);
+    sbc_hook_grid_getter("SBHIconManager", "listWithNonDefaultSizedIconsGridSizeForFolderClass:",
+                         (IMP)sbc_mgr_widget_list_grid, (IMP *)&sbc_orig_mgr_widget_list_grid);
+    sbc_hook_grid_getter("SBHIconModel", "listGridSizeForFolderClass:",
+                         (IMP)sbc_model_list_grid, (IMP *)&sbc_orig_model_list_grid);
+}
+
 // --------------------------------------------------- launch-time instant apply
 //
 // sbc_apply() runs a few seconds after launch (it needs the icon list views
@@ -2150,6 +2240,7 @@ static void sbc_respring_notification(CFNotificationCenterRef center, void *obse
     // from inside a random app.
     %init(SpringBoard);
     sbc_install_landscape_hooks();
+    sbc_install_ios18_grid_hooks();
     sbt_install_home_double_tap_hook();
     // Do not write or migrate preferences during SpringBoard construction.
     // On iOS 15, synchronous cfprefsd writes here can stall SpringBoard before
