@@ -1,4 +1,5 @@
 #import <Preferences/PSListController.h>
+#import <Preferences/PSSpecifier.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import "../SBTDefaults.h"
 
@@ -88,6 +89,21 @@ static void sbc_post_notification(CFStringRef name) {
 @interface SBTGridSpacingListController : SBTNotifyingListController @end
 @implementation SBTGridSpacingListController
 - (NSString *)plistName { return @"GridSpacing"; }
+- (NSArray *)specifiers {
+    if (!_specifiers) {
+        NSMutableArray *specifiers = [[super specifiers] mutableCopy];
+        // Free Icon Placement turns on iOS 17's snap to grid; iOS 18 places
+        // icons freely by itself, and iOS 16 and earlier do not have it.
+        if ([NSProcessInfo processInfo].operatingSystemVersion.majorVersion != 17) {
+            NSIndexSet *hidden = [specifiers indexesOfObjectsPassingTest:^BOOL(PSSpecifier *spec, NSUInteger idx, BOOL *stop) {
+                return [@[@"freeIconPlacementGroup", @"freeIconPlacement"] containsObject:spec.identifier];
+            }];
+            [specifiers removeObjectsAtIndexes:hidden];
+        }
+        _specifiers = specifiers;
+    }
+    return _specifiers;
+}
 @end
 
 
