@@ -794,7 +794,8 @@ static void sbc_install_landscape_hooks(void) {
 // ---------------------------------------- iOS 18: Home Screen page capacity
 //
 // SBTweaker's view hooks show the custom rows/columns, but each Home Screen
-// page's list model keeps the grid it was created with — stock 4x6. iOS 18's
+// page's list model keeps the grid it was created with — stock 4x6. iOS 17's
+// and 18's
 // free placement and the page capacity work against that model grid, so a
 // page counted as full at 24 cells: icons could not be dropped into the
 // visible extra rows, and a widget could not move down into an empty row.
@@ -807,17 +808,17 @@ static void sbc_install_landscape_hooks(void) {
 // Overriding the model's gridSize getter afterwards (the earlier widget test
 // builds) is not enough: the model keeps its stored grid.
 
-static BOOL sbc_is_ios18_or_newer(void) {
+static BOOL sbc_is_ios17_or_newer(void) {
     static BOOL result;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        result = [NSProcessInfo processInfo].operatingSystemVersion.majorVersion >= 18;
+        result = [NSProcessInfo processInfo].operatingSystemVersion.majorVersion >= 17;
     });
     return result;
 }
 
 static SBCGridSize sbc_root_list_grid(Class folderClass, SBCGridSize original, const char *source) {
-    if (!sbc_is_ios18_or_newer() || !folderClass) return original;
+    if (!sbc_is_ios17_or_newer() || !folderClass) return original;
     // Empty means "no special grid" (e.g. the widget-page variant on iPhone);
     // keep it empty so SpringBoard's early-outs stay intact.
     if (!original.columns || !original.rows) return original;
@@ -1032,21 +1033,207 @@ static void sbc_install_direct_placement_hooks(void) {
                      (IMP)sbc_move_placeholder, (IMP *)&sbc_orig_move_placeholder);
 }
 
-static void sbc_install_ios18_grid_hooks(void) {
-    if (!sbc_is_ios18_or_newer()) return;
-    sbc_hook_grid_getter("SBHIconManager", "listGridSizeForFolderClass:",
-                         (IMP)sbc_mgr_list_grid, (IMP *)&sbc_orig_mgr_list_grid);
-    sbc_hook_grid_getter("SBHIconManager", "listWithNonDefaultSizedIconsGridSizeForFolderClass:",
-                         (IMP)sbc_mgr_widget_list_grid, (IMP *)&sbc_orig_mgr_widget_list_grid);
-    sbc_hook_grid_getter("SBHIconModel", "listGridSizeForFolderClass:",
-                         (IMP)sbc_model_list_grid, (IMP *)&sbc_orig_model_list_grid);
+// iOS 17 already contains the Home Screen "snap to grid" of iOS 18 (icons
+// keep the cell they are dropped on, gaps allowed), switched off on iPhone:
+// the drag manager asks its delegate whether snapping is allowed and whether
+// a location can snap, and a drop only keeps its cell when the list's fixed
+// icon location behavior says so. In iOS 17 that is 1 (keep the cell for
+// snap-to-grid insertions; 2 always, 3 widgets only, and these two also
+// require fixed positions). iOS 18 renumbered these and uses 4.
+#define SBC_FIXED_LOCATIONS_ON_SNAP 1LL
+
+static long long (*sbc_orig_model_fixed_behavior)(id, SEL, Class) = NULL;
+static long long sbc_model_fixed_behavior(id self, SEL _cmd, Class folderClass) {
+    long long r = sbc_orig_model_fixed_behavior(self, _cmd, folderClass);
+    Class rootFolderClass = objc_getClass("SBRootFolder");
+    if (!r && folderClass && rootFolderClass && [folderClass isSubclassOfClass:rootFolderClass] &&
+        sbc_free_widget_layout_enabled())
+        r = SBC_FIXED_LOCATIONS_ON_SNAP;
+    return r;
+}
+
+static long long (*sbc_orig_folder_fixed_behavior)(id, SEL) = NULL;
+static long long sbc_folder_fixed_behavior(id self, SEL _cmd) {
+    long long r = sbc_orig_folder_fixed_behavior(self, _cmd);
+    Class rootFolderClass = objc_getClass("SBRootFolder");
+    if (!r && rootFolderClass && [self isKindOfClass:rootFolderClass] && sbc_free_widget_layout_enabled())
+        r = SBC_FIXED_LOCATIONS_ON_SNAP;
+    return r;
+}
+
+static long long (*sbc_orig_list_fixed_behavior)(id, SEL) = NULL;
+static long long sbc_list_fixed_behavior(id self, SEL _cmd) {
+    long long r = sbc_orig_list_fixed_behavior(self, _cmd);
+    if (!r && sbc_list_is_root(self) && sbc_free_widget_layout_enabled())
+        r = SBC_FIXED_LOCATIONS_ON_SNAP;
+    return r;
+}
+
+static BOOL (*sbc_orig_snap_allowed)(id, SEL) = NULL;
+static BOOL sbc_snap_allowed(id self, SEL _cmd) {
+    return sbc_orig_snap_allowed(self, _cmd) || sbc_free_widget_layout_enabled();
+}
+
+static BOOL (*sbc_orig_can_snap_in_location)(id, SEL, id) = NULL;
+static BOOL sbc_can_snap_in_location(id self, SEL _cmd, id location) {
+    if (sbc_orig_can_snap_in_location(self, _cmd, location)) return YES;
+    return [location isKindOfClass:[NSString class]] && [location hasPrefix:@"SBIconLocationRoot"] &&
+           sbc_free_widget_layout_enabled();
+}
+
+// iOS 17 only adds the snap-to-grid placeholder options (2: insert at a fixed
+// cell, 4) when the dragged item has a non-default size class, i.e. for
+// widgets; app icons are still placed by order. The placeholder's options
+// get them for every drag on a Home Screen page.
+#define SBC_PLACEHOLDER_SNAP_OPTIONS 0x6ULL
+
+static unsigned long long (*sbc_orig_placeholder_options)(id, SEL) = NULL;
+static unsigned long long sbc_placeholder_options(id self, SEL _cmd) {
+    unsigned long long r = sbc_orig_placeholder_options(self, _cmd);
+    if ((r & SBC_PLACEHOLDER_SNAP_OPTIONS) == SBC_PLACEHOLDER_SNAP_OPTIONS || !sbc_free_widget_layout_enabled())
+        return r;
+    id listView = [self respondsToSelector:@selector(listView)] ? [self performSelector:@selector(listView)] : nil;
+    if (![listView respondsToSelector:@selector(iconLocation)]) return r;
+    NSString *location = [listView performSelector:@selector(iconLocation)];
+    if ([location isKindOfClass:[NSString class]] && [location hasPrefix:@"SBIconLocationRoot"])
+        r |= SBC_PLACEHOLDER_SNAP_OPTIONS;
+    return r;
+}
+
+static BOOL (*sbc_orig_context_snap_allowed)(id, SEL) = NULL;
+static BOOL sbc_context_snap_allowed(id self, SEL _cmd) {
+    return sbc_orig_context_snap_allowed(self, _cmd) || sbc_free_widget_layout_enabled();
+}
+
+// The drop, too, passes its snap-to-grid insertion options only for items
+// with a non-default size class; an app icon is inserted with none and the
+// page closes the gap again. While a drop onto a Home Screen page runs, the
+// root folder insertion gets the options a snapped widget would.
+#define SBC_SNAP_DROP_OPTIONS 0x302ULL
+static __thread BOOL sbc_snap_drop = NO;
+
+static void (*sbc_orig_snap_perform_drop)(id, SEL, id, id, id, id) = NULL;
+static void sbc_snap_perform_drop(id self, SEL _cmd, id drop, id identifier, id iconIdentifiers, id listView) {
+    BOOL previous = sbc_snap_drop;
+    NSString *location = [listView respondsToSelector:@selector(iconLocation)]
+        ? [listView performSelector:@selector(iconLocation)] : nil;
+    sbc_snap_drop = [location isKindOfClass:[NSString class]] && [location hasPrefix:@"SBIconLocationRoot"] &&
+                    sbc_free_widget_layout_enabled();
+    sbc_orig_snap_perform_drop(self, _cmd, drop, identifier, iconIdentifiers, listView);
+    sbc_snap_drop = previous;
+}
+
+static id (*sbc_orig_folder_insert_at_path)(id, SEL, id, id, unsigned long long) = NULL;
+static id sbc_folder_insert_at_path(id self, SEL _cmd, id icon, id gridPath, unsigned long long options) {
+    Class rootFolderClass = objc_getClass("SBRootFolder");
+    if (sbc_snap_drop && rootFolderClass && [self isKindOfClass:rootFolderClass])
+        options |= SBC_SNAP_DROP_OPTIONS;
+    return sbc_orig_folder_insert_at_path(self, _cmd, icon, gridPath, options);
+}
+
+#ifdef SBT_DIAG
+void sbt_diag_trace(NSString *line);
+#define SBT_TRACE(fmt, ...) sbt_diag_trace([NSString stringWithFormat:fmt, ##__VA_ARGS__])
+#else
+#define SBT_TRACE(fmt, ...) do {} while (0)
+#endif
+
+// With icons at fixed positions, moving an item makes the list relocate the
+// fixed icons in the target range, looked up in the grid for the given
+// options. On iOS 17 with a custom grid that grid can differ from the one the
+// range was computed in, and SpringBoardHome then aborts on an assertion.
+// Such a relocation is skipped instead.
+typedef struct { unsigned long long start; SBCGridSize size; } SBCGridRange;
+static id (*sbc_orig_relocate_fixed)(id, SEL, SBCGridRange, unsigned long long) = NULL;
+static id sbc_relocate_fixed(id self, SEL _cmd, SBCGridRange range, unsigned long long options) {
+    if ([self respondsToSelector:@selector(gridCellInfoWithOptions:)]) {
+        id info = ((id (*)(id, SEL, unsigned long long))objc_msgSend)(self, @selector(gridCellInfoWithOptions:), options);
+        SBCGridSize grid = [info respondsToSelector:@selector(gridSize)]
+            ? ((SBCGridSize (*)(id, SEL))objc_msgSend)(info, @selector(gridSize)) : (SBCGridSize){0, 0};
+        BOOL fits = grid.columns && grid.rows && range.start < (unsigned long long)grid.columns * grid.rows &&
+                    range.start % grid.columns + range.size.columns <= grid.columns &&
+                    range.start / grid.columns + range.size.rows <= grid.rows;
+        SBT_TRACE(@"fix relocate start=%llu size=%ux%u opts=%llu grid=%ux%u -> %@", range.start,
+                  range.size.columns, range.size.rows, options, grid.columns, grid.rows, fits ? @"ok" : @"SKIP");
+        if (!fits) {
+            NSLog(@"[SBC:I17] skipping fixed icon relocation for range %llu %ux%u in %ux%u grid",
+                  range.start, range.size.columns, range.size.rows, grid.columns, grid.rows);
+            return nil;
+        }
+    }
+    return sbc_orig_relocate_fixed(self, _cmd, range, options);
+}
+
+static void sbc_install_ios17_snap_hooks(void) {
+    Class cls = objc_getClass("SBIconDragManager");
+    Method allowed = cls ? class_getInstanceMethod(cls, sel_registerName("isSnapToGridAllowed")) : NULL;
+    Method inLocation = cls ? class_getInstanceMethod(cls, sel_registerName("canSnapToGridInIconLocation:")) : NULL;
+    if (!allowed || !inLocation || strcmp(method_getTypeEncoding(allowed), "B16@0:8") != 0 ||
+        strcmp(method_getTypeEncoding(inLocation), "B24@0:8@16") != 0) {
+        NSLog(@"[SBC:I17] snap to grid unavailable");
+        return;
+    }
+    sbc_hook_layout_behavior("SBHIconModel", "listsFixedIconLocationBehaviorForFolderClass:", 3,
+                             (IMP)sbc_model_fixed_behavior, (IMP *)&sbc_orig_model_fixed_behavior);
+    sbc_hook_layout_behavior("SBFolder", "listsFixedIconLocationBehavior", 2,
+                             (IMP)sbc_folder_fixed_behavior, (IMP *)&sbc_orig_folder_fixed_behavior);
+    sbc_hook_layout_behavior("SBIconListModel", "fixedIconLocationBehavior", 2,
+                             (IMP)sbc_list_fixed_behavior, (IMP *)&sbc_orig_list_fixed_behavior);
+    MSHookMessageEx(cls, sel_registerName("isSnapToGridAllowed"),
+                    (IMP)sbc_snap_allowed, (IMP *)&sbc_orig_snap_allowed);
+    MSHookMessageEx(cls, sel_registerName("canSnapToGridInIconLocation:"),
+                    (IMP)sbc_can_snap_in_location, (IMP *)&sbc_orig_can_snap_in_location);
+    sbc_hook_layout_behavior("SBIconListViewPlaceholderAssertion", "options", 2,
+                             (IMP)sbc_placeholder_options, (IMP *)&sbc_orig_placeholder_options);
+    // The drop asks the drag context, which keeps its own copy.
+    Class contextCls = objc_getClass("SBIconDragContext");
+    Method contextAllowed = contextCls ? class_getInstanceMethod(contextCls, sel_registerName("isSnapToGridAllowed")) : NULL;
+    if (contextAllowed && strcmp(method_getTypeEncoding(contextAllowed), "B16@0:8") == 0)
+        MSHookMessageEx(contextCls, sel_registerName("isSnapToGridAllowed"),
+                        (IMP)sbc_context_snap_allowed, (IMP *)&sbc_orig_context_snap_allowed);
+    else
+        NSLog(@"[SBC:I17] drag context snap to grid unavailable");
+
+    sbc_hook_checked("SBIconDragManager",
+                     "predictable_performIconDrop:identifier:draggedIconIdentifiers:inIconListView:",
+                     "v48@0:8@16@24@32@40",
+                     (IMP)sbc_snap_perform_drop, (IMP *)&sbc_orig_snap_perform_drop);
+    Class folderCls = objc_getClass("SBFolder");
+    SEL insertSel = sel_registerName("insertIcon:atGridPath:options:");
+    Method insert = folderCls ? class_getInstanceMethod(folderCls, insertSel) : NULL;
+    char optionsType[8] = {0};
+    if (insert) method_getArgumentType(insert, 4, optionsType, sizeof optionsType);
+    if (insert && method_getTypeEncoding(insert)[0] == '@' && method_getNumberOfArguments(insert) == 5 &&
+        (optionsType[0] == 'Q' || optionsType[0] == 'q'))
+        MSHookMessageEx(folderCls, insertSel, (IMP)sbc_folder_insert_at_path, (IMP *)&sbc_orig_folder_insert_at_path);
+    else
+        NSLog(@"[SBC:I17] folder grid path insertion unavailable");
+
+    sbc_hook_checked("SBIconListModel", "relocateFixedIconsInGridRange:gridCellInfoOptions:",
+                     "@40@0:8{SBHIconGridRange=Q{SBHIconGridSize=SS}}16Q32",
+                     (IMP)sbc_relocate_fixed, (IMP *)&sbc_orig_relocate_fixed);
+}
+
+static void sbc_install_home_layout_hooks(void) {
+    NSInteger major = [NSProcessInfo processInfo].operatingSystemVersion.majorVersion;
+    if (major < 17) return;
+    // Free widget placement: iOS 17 and later.
     sbc_hook_layout_behavior("SBHIconModel", "listsIconLayoutBehaviorForFolderClass:", 3,
                              (IMP)sbc_model_layout_behavior, (IMP *)&sbc_orig_model_layout_behavior);
     sbc_hook_layout_behavior("SBFolder", "listsIconLayoutBehavior", 2,
                              (IMP)sbc_folder_layout_behavior, (IMP *)&sbc_orig_folder_layout_behavior);
     sbc_hook_layout_behavior("SBIconListModel", "iconLayoutBehavior", 2,
                              (IMP)sbc_list_layout_behavior, (IMP *)&sbc_orig_list_layout_behavior);
-    sbc_install_direct_placement_hooks();
+    if (major < 18)
+        sbc_install_ios17_snap_hooks();
+    else
+        sbc_install_direct_placement_hooks();
+    sbc_hook_grid_getter("SBHIconManager", "listGridSizeForFolderClass:",
+                         (IMP)sbc_mgr_list_grid, (IMP *)&sbc_orig_mgr_list_grid);
+    sbc_hook_grid_getter("SBHIconManager", "listWithNonDefaultSizedIconsGridSizeForFolderClass:",
+                         (IMP)sbc_mgr_widget_list_grid, (IMP *)&sbc_orig_mgr_widget_list_grid);
+    sbc_hook_grid_getter("SBHIconModel", "listGridSizeForFolderClass:",
+                         (IMP)sbc_model_list_grid, (IMP *)&sbc_orig_model_list_grid);
 }
 
 // --------------------------------------------------- launch-time instant apply
@@ -2408,7 +2595,7 @@ static void sbc_respring_notification(CFNotificationCenterRef center, void *obse
     // from inside a random app.
     %init(SpringBoard);
     sbc_install_landscape_hooks();
-    sbc_install_ios18_grid_hooks();
+    sbc_install_home_layout_hooks();
     sbt_install_home_double_tap_hook();
     // Do not write or migrate preferences during SpringBoard construction.
     // On iOS 15, synchronous cfprefsd writes here can stall SpringBoard before

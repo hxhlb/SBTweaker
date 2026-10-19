@@ -275,9 +275,19 @@ static void dg_schedule_snapshot(NSString *reason) {
 // ---- drag tracing: what cell iOS proposes / accepts for a widget ----
 typedef struct { unsigned long long start; DGGridSize size; } DGGridRange;
 
+// A grid size class is a string on iOS 18 and a plain number on iOS 17
+// (0 = app icon), so it is passed around here as a raw pointer.
+static NSString *dg_size_class(void *cls) {
+    if (!cls) return @"nil";
+    if ([NSProcessInfo processInfo].operatingSystemVersion.majorVersion < 18)
+        return [NSString stringWithFormat:@"%lu", (unsigned long)cls];
+    return [(__bridge id)cls description];
+}
+
 static BOOL dg_is_widget(id icon) {
     NSString *c = dg_call(icon, @"gridSizeClass", nil);
-    return c.length && ![c containsString:@"Default"] && ![c isEqualToString:@"-"];
+    return c.length && ![c containsString:@"Default"] && ![c isEqualToString:@"-"] &&
+           ![c isEqualToString:@"0"] && ![c isEqualToString:@"nil"];
 }
 
 static NSString *dg_last_trace = nil;
@@ -287,6 +297,7 @@ static void dg_trace(NSString *line) {
     dg_log(line);
 }
 #define DT(fmt, ...) dg_trace([NSString stringWithFormat:fmt, ##__VA_ARGS__])
+void sbt_diag_trace(NSString *line) { dg_trace(line); }
 
 %group DiagDrag
 %hook SBIconListView
@@ -326,9 +337,9 @@ static void dg_trace(NSString *line) {
     %orig;
     DT(@"mgr performIconDrop end");
 }
-- (BOOL)isSnapToGridEnabledForDragWithIdentifier:(id)ident iconLocation:(id)loc listModel:(id)model placeholderGridSizeClass:(id)cls {
+- (BOOL)isSnapToGridEnabledForDragWithIdentifier:(id)ident iconLocation:(id)loc listModel:(id)model placeholderGridSizeClass:(void *)cls {
     BOOL r = %orig;
-    DT(@"mgr snapToGrid cls=%@ -> %d", cls, r);
+    DT(@"mgr snapToGrid cls=%@ -> %d", dg_size_class(cls), r);
     return r;
 }
 %end
@@ -394,9 +405,9 @@ static void dg_trace(NSString *line) {
     if (dg_is_widget(icon)) DT(@"model insertIcon cell=%llu opts=%llu mut=%llu", cell, o, m);
     return %orig;
 }
-- (long long)_moveIcon:(id)icon byClusteringForSizeClass:(id)cls toGridCellIndex:(unsigned long long)cell gridCellInfoOptions:(unsigned long long)o {
+- (long long)_moveIcon:(id)icon byClusteringForSizeClass:(void *)cls toGridCellIndex:(unsigned long long)cell gridCellInfoOptions:(unsigned long long)o {
     long long r = %orig;
-    if (dg_is_widget(icon)) DT(@"model moveByClustering cell=%llu cls=%@ -> %lld", cell, cls, r);
+    if (dg_is_widget(icon)) DT(@"model moveByClustering cell=%llu cls=%@ -> %lld", cell, dg_size_class(cls), r);
     return r;
 }
 - (id)insertIconWhilePreservingQuads:(id)icon toGridCellIndex:(unsigned long long)cell gridCellInfoOptions:(unsigned long long)o mutationOptions:(unsigned long long)m {
