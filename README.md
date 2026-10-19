@@ -11,7 +11,10 @@ These are in-process Substrate-hook reimplementations of my
   so newly enabled slots can be filled without a respring
 - **Home Screen grid**: configurable columns and rows (1–10), set
   independently for portrait and landscape (landscape only affects rotating
-  Home Screens, i.e. iPad)
+  Home Screens, i.e. iPad); on iOS 18, widgets can go on any row and column
+  of the custom grid
+- **Free Icon Placement** (iOS 17): apps and widgets stay where they are
+  dropped, with gaps, like on iOS 18
 - **Spacing**: independent portrait and landscape Home Screen insets, plus
   independent left and right dock spacing
 - **Icon scale**: separate Home Screen and Dock scaling; the Home value applies
@@ -44,6 +47,27 @@ These are in-process Substrate-hook reimplementations of my
 All settings live in Settings → SBTweaker. Every feature is opt-in and off by
 default; enabling the master switch alone changes nothing. Layout controls
 apply live, and a respring button is included for changes that need one.
+
+## Version 1.3.8
+
+- On iOS 17 and 18 the root folder's pages are created with the custom grid
+  (`listGridSizeForFolderClass:` and its widget variant on `SBHIconManager`
+  and `SBHIconModel`), so the list models' grid cell info matches the views.
+  Overriding the models' `gridSize` afterwards left their stored 4x6 grid.
+- Root lists get the `allowedOnAnyRow` and `allowedOnAnyColumn` icon layout
+  behavior flags (`SBHIconModel`, `SBFolder`, `SBIconListModel`). Without
+  them, layout moves a saved widget position that is off the 2x2 blocks.
+- On iOS 18, `prioritizesDirectIconPlacement` is reported while a widget is
+  dragged over a Home Screen page (placeholder update and move only), so the
+  widget's cells are centred on the drag point instead of taking the cell
+  under its centre as the top-left cell.
+- iOS 17's snap to grid is turned on by Free Icon Placement: fixed icon
+  location behavior 1 (iOS 17 numbering) for the root lists, snapping allowed
+  on the drag manager and the drag context and in root locations, and the
+  snap options added to the drag placeholder and to the drop's root folder
+  insertion for app icons, where SpringBoardHome only adds them for widgets.
+- A fixed-icon relocation whose range does not fit the grid it is looked up
+  in is skipped instead of reaching SpringBoardHome's assertion.
 
 ## Version 1.3.7
 

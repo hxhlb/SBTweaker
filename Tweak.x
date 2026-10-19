@@ -1142,13 +1142,6 @@ static id sbc_folder_insert_at_path(id self, SEL _cmd, id icon, id gridPath, uns
     return sbc_orig_folder_insert_at_path(self, _cmd, icon, gridPath, options);
 }
 
-#ifdef SBT_DIAG
-void sbt_diag_trace(NSString *line);
-#define SBT_TRACE(fmt, ...) sbt_diag_trace([NSString stringWithFormat:fmt, ##__VA_ARGS__])
-#else
-#define SBT_TRACE(fmt, ...) do {} while (0)
-#endif
-
 // With icons at fixed positions, moving an item makes the list relocate the
 // fixed icons in the target range, looked up in the grid for the given
 // options. On iOS 17 with a custom grid that grid can differ from the one the
@@ -1164,8 +1157,6 @@ static id sbc_relocate_fixed(id self, SEL _cmd, SBCGridRange range, unsigned lon
         BOOL fits = grid.columns && grid.rows && range.start < (unsigned long long)grid.columns * grid.rows &&
                     range.start % grid.columns + range.size.columns <= grid.columns &&
                     range.start / grid.columns + range.size.rows <= grid.rows;
-        SBT_TRACE(@"fix relocate start=%llu size=%ux%u opts=%llu grid=%ux%u -> %@", range.start,
-                  range.size.columns, range.size.rows, options, grid.columns, grid.rows, fits ? @"ok" : @"SKIP");
         if (!fits) {
             NSLog(@"[SBC:I17] skipping fixed icon relocation for range %llu %ux%u in %ux%u grid",
                   range.start, range.size.columns, range.size.rows, grid.columns, grid.rows);

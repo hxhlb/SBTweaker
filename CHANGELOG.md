@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.8
+
+- Widgets can now be placed on any row and column of a custom Home Screen
+  grid on iOS 18, instead of only on the 2x2 blocks of the stock grid, and
+  stay under your finger while you drag them.
+- Home Screen pages are now created with the custom grid on iOS 17 and 18,
+  so they hold as many icons as they show and widgets can move into the
+  extra rows and columns.
+- Added an opt-in Free Icon Placement switch for iOS 17 under Grid and
+  Spacing: apps and widgets stay on the spot they are dropped on, with gaps,
+  like on iOS 18, and the layout survives a respring. With a custom grid,
+  widgets can then use any row and column too. Takes effect after a respring.
+
 ## 1.3.7
 
 - Added an opt-in Fast Sheets switch: sheets and pop-ups — the share sheet
