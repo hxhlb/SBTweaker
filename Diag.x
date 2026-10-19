@@ -37,6 +37,12 @@ static NSString *dg_short(id obj, NSUInteger max) {
 
 // Calls a getter (no args) or a one-object-argument method, if its return
 // type is one we can call safely. Returns a printable value.
+static id dg_call_obj(id obj, NSString *name) {
+    SEL sel = NSSelectorFromString(name);
+    if (!obj || ![obj respondsToSelector:sel]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+}
+
 static NSString *dg_call(id obj, NSString *name, id arg) {
     if (!obj) return @"nil";
     SEL sel = NSSelectorFromString(name);
@@ -99,7 +105,7 @@ static NSString *dg_call(id obj, NSString *name, id arg) {
     }
 }
 
-static void dg_dump_methods(void) {
+__attribute__((unused)) static void dg_dump_methods(void) {
     NSArray *classes = @[@"SBIconListModel", @"SBIconListView", @"SBRootIconListView",
                          @"SBIconListGridLayoutConfiguration", @"SBIconListGridLayout",
                          @"SBHIconGridSizeClassSizeMap", @"SBIconListFlowLayout",
@@ -123,6 +129,48 @@ static void dg_dump_methods(void) {
         [lines sortUsingSelector:@selector(compare:)];
         for (NSString *l in lines) dg_log(l);
     }
+}
+
+// Drag/drop placement classes in SpringBoardHome: which code snaps a widget
+// to a cell before the list model is asked.
+__attribute__((unused)) static void dg_dump_drag_classes(void) {
+    Class ref = objc_getClass("SBIconListModel");
+    const char *image = ref ? class_getImageName(ref) : NULL;
+    if (!image) { DL(@"## drag dump: no image"); return; }
+    unsigned count = 0;
+    const char **names = objc_copyClassNamesForImage(image, &count);
+    NSRegularExpression *clsRe = [NSRegularExpression
+        regularExpressionWithPattern:@"(?i)drag|drop|snap|placement|reorder|insertion|quad" options:0 error:nil];
+    NSRegularExpression *selRe = [NSRegularExpression
+        regularExpressionWithPattern:@"(?i)grid|cell|coordinate|index|range|point|location|snap|quad|align|insert|drop|target"
+        options:0 error:nil];
+    DL(@"## drag dump: %u classes in %s", count, image);
+    for (unsigned c = 0; c < count; c++) {
+        NSString *cn = @(names[c]);
+        BOOL isListView = [cn isEqualToString:@"SBIconListView"];
+        if (!isListView && ![clsRe firstMatchInString:cn options:0 range:NSMakeRange(0, cn.length)]) continue;
+        Class cls = objc_getClass(names[c]);
+        if (!cls) continue;
+        NSMutableArray *lines = [NSMutableArray array];
+        unsigned n = 0;
+        Method *list = class_copyMethodList(cls, &n);
+        for (unsigned i = 0; i < n; i++) {
+            NSString *sel = NSStringFromSelector(method_getName(list[i]));
+            if (isListView) {
+                // grid/cell methods of the list view were dumped before; only drag ones here
+                if ([sel rangeOfString:@"rag" options:NSCaseInsensitiveSearch].location == NSNotFound &&
+                    [sel rangeOfString:@"drop" options:NSCaseInsensitiveSearch].location == NSNotFound &&
+                    [sel rangeOfString:@"snap" options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+            } else if (![selRe firstMatchInString:sel options:0 range:NSMakeRange(0, sel.length)]) continue;
+            [lines addObject:[NSString stringWithFormat:@"  -%@  %s", sel, method_getTypeEncoding(list[i])]];
+        }
+        free(list);
+        if (!lines.count) continue;
+        [lines sortUsingSelector:@selector(compare:)];
+        DL(@"## class %@ : %@", cn, NSStringFromClass(class_getSuperclass(cls)));
+        for (NSString *l in lines) dg_log(l);
+    }
+    free(names);
 }
 
 // Which image implements a method now — SBTweaker.dylib means our hook is
@@ -224,6 +272,224 @@ static void dg_schedule_snapshot(NSString *reason) {
 %end
 %end
 
+// ---- drag tracing: what cell iOS proposes / accepts for a widget ----
+typedef struct { unsigned long long start; DGGridSize size; } DGGridRange;
+
+static BOOL dg_is_widget(id icon) {
+    NSString *c = dg_call(icon, @"gridSizeClass", nil);
+    return c.length && ![c containsString:@"Default"] && ![c isEqualToString:@"-"];
+}
+
+static NSString *dg_last_trace = nil;
+static void dg_trace(NSString *line) {
+    if ([line isEqualToString:dg_last_trace]) return;
+    dg_last_trace = line;
+    dg_log(line);
+}
+#define DT(fmt, ...) dg_trace([NSString stringWithFormat:fmt, ##__VA_ARGS__])
+
+%group DiagDrag
+%hook SBIconListView
+- (DGGridRange)closestGridRangeForIconOfSize:(DGGridSize)size centeredAtPoint:(CGPoint)pt {
+    DGGridRange r = %orig;
+    if (size.columns > 1 || size.rows > 1)
+        DT(@"view closestGridRange size=%ux%u pt=(%.0f,%.0f) -> start=%llu %ux%u", size.columns, size.rows,
+           pt.x, pt.y, r.start, r.size.columns, r.size.rows);
+    return r;
+}
+- (unsigned long long)bestGridCellIndexForInsertingIcon:(id)icon atCoordinate:(DGCoordinate)c {
+    unsigned long long r = %orig;
+    if (dg_is_widget(icon)) DT(@"view bestCellForInserting coord=(c%lld,r%lld) -> %llu", c.col, c.row, r);
+    return r;
+}
+%end
+
+%hook SBIconDragManager
+- (unsigned long long)placeholderGridCellIndexForDragPlacement:(long long)place onGridCellIndex:(unsigned long long)cell icon:(id)icon inListView:(id)lv forDragWithIdentifier:(id)ident {
+    unsigned long long r = %orig;
+    if (dg_is_widget(icon)) DT(@"mgr placeholderCell place=%lld on=%llu -> %llu (lv %p icon %@ %p)", place, cell, r, lv, [icon class], icon);
+    return r;
+}
+- (long long)placeholderMovementForDragHitRegion:(unsigned long long)region onGridCellIndex:(unsigned long long)cell inListView:(id)lv forDragWithIdentifier:(id)ident draggedIconIdentifiers:(id)ids {
+    long long r = %orig;
+    DT(@"mgr placeholderMovement region=%llu on=%llu -> %lld", region, cell, r);
+    return r;
+}
+- (BOOL)movePlaceholderForDraggedIcons:(NSArray *)icons toGridCellIndex:(unsigned long long)cell inListView:(id)lv forDragWithIdentifier:(id)ident {
+    BOOL r = %orig;
+    BOOL w = NO; for (id i in icons) w |= dg_is_widget(i);
+    if (w) DT(@"mgr movePlaceholder to=%llu -> %d", cell, r);
+    return r;
+}
+- (void)iconListView:(id)lv performIconDrop:(id)drop {
+    DT(@"mgr performIconDrop begin lv %p", lv);
+    %orig;
+    DT(@"mgr performIconDrop end");
+}
+- (BOOL)isSnapToGridEnabledForDragWithIdentifier:(id)ident iconLocation:(id)loc listModel:(id)model placeholderGridSizeClass:(id)cls {
+    BOOL r = %orig;
+    DT(@"mgr snapToGrid cls=%@ -> %d", cls, r);
+    return r;
+}
+%end
+
+%hook SBIconListView
+- (unsigned long long)dragHitRegionForPoint:(CGPoint)pt icon:(id)icon {
+    unsigned long long r = %orig;
+    if (dg_is_widget(icon)) DT(@"view hitRegion pt=(%.0f,%.0f) -> %llu", pt.x, pt.y, r);
+    return r;
+}
+%end
+
+%hook SBIconListViewPlaceholderAssertion
+- (unsigned long long)effectiveGridCellIndex {
+    unsigned long long r = %orig;
+    id icon = dg_call_obj(self, @"placeholderIcon");
+    if (dg_is_widget(icon)) {
+        id lv = dg_call_obj(self, @"listView");
+        id model = dg_call_obj(lv, @"model");
+        unsigned long long opts = [lv respondsToSelector:@selector(gridCellInfoOptions)]
+            ? ((unsigned long long (*)(id, SEL))objc_msgSend)(lv, @selector(gridCellInfoOptions)) : 0;
+        unsigned long long mc = [model respondsToSelector:@selector(gridCellIndexForIcon:gridCellInfoOptions:)]
+            ? ((unsigned long long (*)(id, SEL, id, unsigned long long))objc_msgSend)(model, @selector(gridCellIndexForIcon:gridCellInfoOptions:), icon, opts) : NSNotFound;
+        unsigned long long iv = ((unsigned long long (*)(id, SEL))objc_msgSend)(self, @selector(gridCellIndex));
+        DT(@"assert effectiveCell -> %llu (ivar %llu model %llu opts %llu)", r, iv, mc, opts);
+    }
+    return r;
+}
+- (void)setGridCellIndex:(unsigned long long)cell {
+    DT(@"assert setGridCellIndex %llu", cell);
+    %orig;
+}
+%end
+
+%hook SBIconListModel
+- (unsigned long long)bestGridCellIndexForMovingIcons:(NSArray *)icons toGridCellIndex:(unsigned long long)cell gridCellInfoOptions:(unsigned long long)o mutationOptions:(unsigned long long)m {
+    unsigned long long r = %orig;
+    BOOL w = NO; for (id i in icons) w |= dg_is_widget(i);
+    if (w) DT(@"model bestCellForMoving to=%llu opts=%llu mut=%llu -> %llu", cell, o, m, r);
+    return r;
+}
+- (BOOL)isInsertionFixedForIcon:(id)icon atGridCellIndex:(unsigned long long)cell gridCellInfoOptions:(unsigned long long)o mutationOptions:(unsigned long long)m {
+    BOOL r = %orig;
+    if (dg_is_widget(icon)) DT(@"model isInsertionFixed cell=%llu -> %d", cell, r);
+    return r;
+}
+- (BOOL)_moveContainedIconWithinAffectedQuadsIfNecessary:(id)icon toGridCellIndex:(unsigned long long)cell gridCellInfoOptions:(unsigned long long)o mutationOptions:(unsigned long long)m {
+    BOOL r = %orig;
+    if (dg_is_widget(icon)) DT(@"model moveWithinQuads cell=%llu -> %d", cell, r);
+    return r;
+}
+- (BOOL)_moveContainedIconLargerThanQuadsIfNecessary:(id)icon toGridCellIndex:(unsigned long long)cell gridCellInfoOptions:(unsigned long long)o mutationOptions:(unsigned long long)m {
+    BOOL r = %orig;
+    if (dg_is_widget(icon)) DT(@"model moveLargerThanQuads cell=%llu -> %d", cell, r);
+    return r;
+}
+- (id)moveContainedIcon:(id)icon toGridCellIndex:(unsigned long long)cell gridCellInfoOptions:(unsigned long long)o mutationOptions:(unsigned long long)m {
+    if (dg_is_widget(icon)) DT(@"model moveContainedIcon -> cell=%llu opts=%llu mut=%llu", cell, o, m);
+    id r = %orig;
+    return r;
+}
+- (id)insertIcon:(id)icon atGridCellIndex:(unsigned long long)cell gridCellInfoOptions:(unsigned long long)o mutationOptions:(unsigned long long)m {
+    if (dg_is_widget(icon)) DT(@"model insertIcon cell=%llu opts=%llu mut=%llu", cell, o, m);
+    return %orig;
+}
+- (long long)_moveIcon:(id)icon byClusteringForSizeClass:(id)cls toGridCellIndex:(unsigned long long)cell gridCellInfoOptions:(unsigned long long)o {
+    long long r = %orig;
+    if (dg_is_widget(icon)) DT(@"model moveByClustering cell=%llu cls=%@ -> %lld", cell, cls, r);
+    return r;
+}
+- (id)insertIconWhilePreservingQuads:(id)icon toGridCellIndex:(unsigned long long)cell gridCellInfoOptions:(unsigned long long)o mutationOptions:(unsigned long long)m {
+    if (dg_is_widget(icon)) DT(@"model insertPreservingQuads cell=%llu", cell);
+    return %orig;
+}
+%end
+%end
+
+// Movement strategies inside -[SBIconListModel moveContainedIcon:...]. Hooked
+// by hand, and only when the return type is BOOL, so a wrong guess cannot crash.
+typedef BOOL (*dg_move5_fn)(id, SEL, id, unsigned long long, id, unsigned long long, unsigned long long);
+#define DG_MOVE5(name, label) \
+    static dg_move5_fn dg_o_##name; \
+    static BOOL dg_h_##name(id self, SEL _cmd, id icon, unsigned long long cell, id info, \
+                            unsigned long long o, unsigned long long m) { \
+        BOOL r = dg_o_##name(self, _cmd, icon, cell, info, o, m); \
+        if (dg_is_widget(icon)) DT(@"model " label " cell=%llu mut=%llu -> %d", cell, m, r); \
+        return r; \
+    }
+DG_MOVE5(autoCluster, "autoCluster")
+DG_MOVE5(simple, "simpleMove")
+DG_MOVE5(twoD, "twoDMove")
+DG_MOVE5(swapV, "swapVertically")
+
+static void dg_hook_move5(const char *selName, IMP h, dg_move5_fn *o) {
+    Class c = objc_getClass("SBIconListModel");
+    SEL sel = sel_registerName(selName);
+    Method m = c ? class_getInstanceMethod(c, sel) : NULL;
+    const char *enc = m ? method_getTypeEncoding(m) : NULL;
+    DL(@"hook %s enc=%s", selName, enc ?: "missing");
+    if (enc && enc[0] == 'B' && method_getNumberOfArguments(m) == 7)
+        MSHookMessageEx(c, sel, h, (IMP *)o);
+}
+
+static void dg_install_move_hooks(void) {
+    dg_hook_move5("_moveContainedIconUsingAutomaticClusteringIfNecessary:toGridCellIndex:gridCellInfo:gridCellInfoOptions:mutationOptions:",
+                  (IMP)dg_h_autoCluster, &dg_o_autoCluster);
+    dg_hook_move5("_moveContainedIconUsingSimpleMovement:toGridCellIndex:gridCellInfo:gridCellInfoOptions:mutationOptions:",
+                  (IMP)dg_h_simple, &dg_o_simple);
+    dg_hook_move5("_moveContainedIconUsingTwoDimensionalMovement:toGridCellIndex:gridCellInfo:gridCellInfoOptions:mutationOptions:",
+                  (IMP)dg_h_twoD, &dg_o_twoD);
+    dg_hook_move5("_moveContainedIconBySwappingVerticallyWithAdjacentIcons:toGridCellIndex:gridCellInfo:gridCellInfoOptions:mutationOptions:",
+                  (IMP)dg_h_swapV, &dg_o_swapV);
+}
+
+static void dg_find_methods(const char *clsName, NSArray *needles) {
+    Class c = objc_getClass(clsName);
+    if (!c) { DL(@"methods %s: class missing", clsName); return; }
+    unsigned int n = 0;
+    Method *ms = class_copyMethodList(c, &n);
+    for (unsigned int i = 0; i < n; i++) {
+        NSString *name = NSStringFromSelector(method_getName(ms[i]));
+        for (NSString *needle in needles) {
+            if ([name rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                DL(@"method -[%s %@] %s", clsName, name, method_getTypeEncoding(ms[i]));
+                break;
+            }
+        }
+    }
+    free(ms);
+}
+
+typedef id (*dg_path_fn)(id, SEL, id);
+static dg_path_fn dg_o_placeholderPath;
+static id dg_h_placeholderPath(id self, SEL _cmd, id ident) {
+    id r = dg_o_placeholderPath(self, _cmd, ident);
+    DT(@"mgr placeholderGridPath -> %@", r);
+    return r;
+}
+typedef BOOL (*dg_drop5_fn)(id, SEL, id, id, id, id, id);
+static dg_drop5_fn dg_o_dropDest;
+static BOOL dg_h_dropDest(id self, SEL _cmd, id icons, id lv, id path, id cls, id session) {
+    DT(@"mgr dropInDestination path=%@ cls=%@", path, cls);
+    BOOL r = dg_o_dropDest(self, _cmd, icons, lv, path, cls, session);
+    DT(@"mgr dropInDestination -> %d", r);
+    return r;
+}
+
+static void dg_install_drop_hooks(void) {
+    Class c = objc_getClass("SBIconDragManager");
+    SEL s1 = sel_registerName("dragPlaceholderGridPathForDragWithIdentifier:");
+    Method m1 = c ? class_getInstanceMethod(c, s1) : NULL;
+    DL(@"hook placeholderGridPath enc=%s", m1 ? method_getTypeEncoding(m1) : "missing");
+    if (m1 && method_getTypeEncoding(m1)[0] == '@' && method_getNumberOfArguments(m1) == 3)
+        MSHookMessageEx(c, s1, (IMP)dg_h_placeholderPath, (IMP *)&dg_o_placeholderPath);
+    SEL s2 = sel_registerName("performIconDropInDestinationListIfPossibleWithDraggedIcons:inIconListView:placeholderGridPath:placeholderGridSizeClass:dropSession:");
+    Method m2 = c ? class_getInstanceMethod(c, s2) : NULL;
+    DL(@"hook dropInDestination enc=%s", m2 ? method_getTypeEncoding(m2) : "missing");
+    if (m2 && method_getTypeEncoding(m2)[0] == 'B' && method_getNumberOfArguments(m2) == 7)
+        MSHookMessageEx(c, s2, (IMP)dg_h_dropDest, (IMP *)&dg_o_dropDest);
+}
+
 %ctor {
     if (![[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.apple.springboard"]) return;
     NSString *path = @"/var/mobile/Documents/SBTweakerDiag.log";
@@ -235,6 +501,9 @@ static void dg_schedule_snapshot(NSString *reason) {
     NSLog(@"[SBT:DIAG] log %@ open=%d", path, dg_file != NULL);
     if (!dg_file) return;
     %init(Diag);
+    %init(DiagDrag);
+    dg_install_move_hooks();
+    dg_install_drop_hooks();
     NSDictionary *prefs = CFBridgingRelease(CFPreferencesCopyMultiple(NULL, CFSTR("cz.kolbi.sbtweaker"),
                                             kCFPreferencesCurrentUser, kCFPreferencesAnyHost));
     DL(@"\n##### SpringBoard start %@ iOS %@", [NSDate date], [UIDevice currentDevice].systemVersion);
@@ -246,7 +515,9 @@ static void dg_schedule_snapshot(NSString *reason) {
         dg_report_hook("SBHIconManager", "listGridSizeForFolderClass:");
         dg_report_hook("SBHIconManager", "listWithNonDefaultSizedIconsGridSizeForFolderClass:");
         dg_report_hook("SBHIconModel", "listGridSizeForFolderClass:");
-        dg_dump_methods();
+        dg_find_methods("SBIconDragManager", @[@"drop", @"path", @"gridcell", @"placeholder"]);
+        dg_find_methods("SBIconListModel", @[@"gridCellIndexFor", @"placeholder", @"gridPath"]);
+        dg_find_methods("SBIconListView", @[@"gridCellIndexFor", @"gridPath", @"placeholder"]);
         dg_schedule_snapshot(@"launch");
     });
 }

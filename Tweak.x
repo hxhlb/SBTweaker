@@ -871,6 +871,167 @@ static void sbc_hook_grid_getter(const char *className, const char *selName, IMP
     MSHookMessageEx(cls, sel, replacement, original);
 }
 
+// ------------------------------------------ iOS 18: widget placement
+//
+// On iPhone, SpringBoardHome keeps widgets on 2x2 blocks ("quads"): a widget
+// may only start on an even row and on a block column or the right edge. That
+// matches the stock 4-column grid, but on a custom grid it leaves out rows and
+// columns (with 5 columns a 2x2 widget could start at columns 1, 3 and 4 only).
+// SpringBoardHome already has the iPad behaviour that places widgets freely;
+// the hooks below turn it on for the Home Screen pages.
+
+static BOOL sbc_list_is_root(id model) {
+    if (![model respondsToSelector:@selector(folder)]) return NO;
+    id folder = [model performSelector:@selector(folder)];
+    Class rootFolderClass = objc_getClass("SBRootFolder");
+    return folder && rootFolderClass && [folder isKindOfClass:rootFolderClass];
+}
+
+// The size class of the icons in a drag (the placeholder's), or nil.
+static id sbc_drag_size_class(id dragManager, id dragID) {
+    if (!dragID || ![dragManager respondsToSelector:@selector(iconDragContextForDragWithIdentifier:)]) return nil;
+    id context = [dragManager performSelector:@selector(iconDragContextForDragWithIdentifier:) withObject:dragID];
+    for (NSString *name in @[@"dragPlaceholderGridSizeClass", @"draggedIconGridSizeClass"]) {
+        SEL sel = NSSelectorFromString(name);
+        if (![context respondsToSelector:sel]) continue;
+        id sizeClass = ((id (*)(id, SEL))objc_msgSend)(context, sel);
+        if (sizeClass) return sizeClass;
+    }
+    return nil;
+}
+
+// Laying out a list, a saved widget position off the 2x2 blocks is discarded
+// and the widget moved, unless the list's "icon layout behavior" has
+// allowedOnAnyRow (1) and allowedOnAnyColumn (2). The root lists get both
+// when the custom grid is on.
+#define SBC_LAYOUT_ANY_ROW_AND_COLUMN 0x3ULL
+
+static BOOL sbc_free_widget_layout_enabled(void) {
+    NSDictionary *p = sbc_prefs();
+    return prefBool(p, @"enabled") && prefBool(p, @"homeGridEnabled");
+}
+
+static unsigned long long (*sbc_orig_model_layout_behavior)(id, SEL, Class) = NULL;
+static unsigned long long sbc_model_layout_behavior(id self, SEL _cmd, Class folderClass) {
+    unsigned long long r = sbc_orig_model_layout_behavior(self, _cmd, folderClass);
+    Class rootFolderClass = objc_getClass("SBRootFolder");
+    if (folderClass && rootFolderClass && [folderClass isSubclassOfClass:rootFolderClass] &&
+        sbc_free_widget_layout_enabled())
+        r |= SBC_LAYOUT_ANY_ROW_AND_COLUMN;
+    return r;
+}
+
+static unsigned long long (*sbc_orig_folder_layout_behavior)(id, SEL) = NULL;
+static unsigned long long sbc_folder_layout_behavior(id self, SEL _cmd) {
+    unsigned long long r = sbc_orig_folder_layout_behavior(self, _cmd);
+    Class rootFolderClass = objc_getClass("SBRootFolder");
+    if (rootFolderClass && [self isKindOfClass:rootFolderClass] && sbc_free_widget_layout_enabled())
+        r |= SBC_LAYOUT_ANY_ROW_AND_COLUMN;
+    return r;
+}
+
+static unsigned long long (*sbc_orig_list_layout_behavior)(id, SEL) = NULL;
+static unsigned long long sbc_list_layout_behavior(id self, SEL _cmd) {
+    unsigned long long r = sbc_orig_list_layout_behavior(self, _cmd);
+    if (sbc_list_is_root(self) && sbc_free_widget_layout_enabled())
+        r |= SBC_LAYOUT_ANY_ROW_AND_COLUMN;
+    return r;
+}
+
+static void sbc_hook_layout_behavior(const char *className, const char *selName, unsigned int args,
+                                     IMP replacement, IMP *original) {
+    Class cls = objc_getClass(className);
+    SEL sel = sel_registerName(selName);
+    Method m = cls ? class_getInstanceMethod(cls, sel) : NULL;
+    const char *enc = m ? method_getTypeEncoding(m) : NULL;
+    if (!enc || (enc[0] != 'Q' && enc[0] != 'q') || method_getNumberOfArguments(m) != args) {
+        NSLog(@"[SBC:I18] -[%s %s] missing or unexpected (%s)", className, selName, enc);
+        return;
+    }
+    MSHookMessageEx(cls, sel, replacement, original);
+}
+
+// While a widget is dragged, the drag manager turns the drag point into a
+// placement in one of two ways. The iPhone way takes the cell under the
+// widget's centre as its top-left cell, so with free rows and columns the
+// widget hangs down and to the right of the finger. With
+// prioritizesDirectIconPlacement (the iPad way) it places the widget's block
+// of cells centred on the drag point instead. It is only turned on while a
+// widget is dragged over a Home Screen page.
+static __thread BOOL sbc_direct_placement = NO;
+
+static BOOL sbc_widget_drag_on_root(id dragManager, id dragID, id listView) {
+    if (!sbc_free_widget_layout_enabled() || !dragID) return NO;
+    if (![listView respondsToSelector:@selector(iconLocation)]) return NO;
+    NSString *location = [listView performSelector:@selector(iconLocation)];
+    if (![location isKindOfClass:[NSString class]] || ![location hasPrefix:@"SBIconLocationRoot"]) return NO;
+    id sizeClass = sbc_drag_size_class(dragManager, dragID);
+    return sizeClass && ![[sizeClass description] containsString:@"Default"];
+}
+
+static BOOL (*sbc_orig_prioritizes_direct)(id, SEL) = NULL;
+static BOOL sbc_prioritizes_direct(id self, SEL _cmd) {
+    return sbc_orig_prioritizes_direct(self, _cmd) || sbc_direct_placement;
+}
+
+static void (*sbc_orig_update_placeholder)(id, SEL, id, id) = NULL;
+static void sbc_update_placeholder(id self, SEL _cmd, id session, id listView) {
+    id dragID = [self respondsToSelector:@selector(uniqueIdentifierForIconDropSession:)]
+        ? [self performSelector:@selector(uniqueIdentifierForIconDropSession:) withObject:session] : nil;
+    BOOL previous = sbc_direct_placement;
+    sbc_direct_placement = sbc_widget_drag_on_root(self, dragID, listView);
+    sbc_orig_update_placeholder(self, _cmd, session, listView);
+    sbc_direct_placement = previous;
+}
+
+static BOOL (*sbc_orig_move_placeholder)(id, SEL, id, unsigned long long, id, id) = NULL;
+static BOOL sbc_move_placeholder(id self, SEL _cmd, id icons, unsigned long long cell, id listView, id dragID) {
+    BOOL previous = sbc_direct_placement;
+    sbc_direct_placement = sbc_widget_drag_on_root(self, dragID, listView);
+    BOOL r = sbc_orig_move_placeholder(self, _cmd, icons, cell, listView, dragID);
+    sbc_direct_placement = previous;
+    return r;
+}
+
+static void sbc_hook_checked(const char *className, const char *selName, const char *encoding,
+                             IMP replacement, IMP *original) {
+    Class cls = objc_getClass(className);
+    SEL sel = sel_registerName(selName);
+    Method m = cls ? class_getInstanceMethod(cls, sel) : NULL;
+    const char *enc = m ? method_getTypeEncoding(m) : NULL;
+    if (!enc || strcmp(enc, encoding) != 0) {
+        NSLog(@"[SBC:I18] -[%s %s] missing or unexpected (%s)", className, selName, enc);
+        return;
+    }
+    MSHookMessageEx(cls, sel, replacement, original);
+}
+
+static void sbc_install_direct_placement_hooks(void) {
+    // All three or none: the getter alone would change every drag.
+    if (!objc_getClass("SBIconDragManager")) return;
+    Class cls = objc_getClass("SBIconDragManager");
+    const char *updSel = "updatePlaceholderPositionForDropSession:inIconListView:";
+    const char *movSel = "movePlaceholderForDraggedIcons:toGridCellIndex:inListView:forDragWithIdentifier:";
+    Method upd = class_getInstanceMethod(cls, sel_registerName(updSel));
+    Method mov = class_getInstanceMethod(cls, sel_registerName(movSel));
+    Method get = class_getInstanceMethod(cls, sel_registerName("prioritizesDirectIconPlacement"));
+    if (!upd || !mov || !get ||
+        strcmp(method_getTypeEncoding(upd), "v32@0:8@16@24") != 0 ||
+        strcmp(method_getTypeEncoding(mov), "B48@0:8@16Q24@32@40") != 0 ||
+        strcmp(method_getTypeEncoding(get), "B16@0:8") != 0 ||
+        ![cls instancesRespondToSelector:@selector(uniqueIdentifierForIconDropSession:)] ||
+        ![cls instancesRespondToSelector:@selector(iconDragContextForDragWithIdentifier:)]) {
+        NSLog(@"[SBC:I18] direct widget placement unavailable");
+        return;
+    }
+    sbc_hook_checked("SBIconDragManager", "prioritizesDirectIconPlacement", "B16@0:8",
+                     (IMP)sbc_prioritizes_direct, (IMP *)&sbc_orig_prioritizes_direct);
+    sbc_hook_checked("SBIconDragManager", updSel, "v32@0:8@16@24",
+                     (IMP)sbc_update_placeholder, (IMP *)&sbc_orig_update_placeholder);
+    sbc_hook_checked("SBIconDragManager", movSel, "B48@0:8@16Q24@32@40",
+                     (IMP)sbc_move_placeholder, (IMP *)&sbc_orig_move_placeholder);
+}
+
 static void sbc_install_ios18_grid_hooks(void) {
     if (!sbc_is_ios18_or_newer()) return;
     sbc_hook_grid_getter("SBHIconManager", "listGridSizeForFolderClass:",
@@ -879,6 +1040,13 @@ static void sbc_install_ios18_grid_hooks(void) {
                          (IMP)sbc_mgr_widget_list_grid, (IMP *)&sbc_orig_mgr_widget_list_grid);
     sbc_hook_grid_getter("SBHIconModel", "listGridSizeForFolderClass:",
                          (IMP)sbc_model_list_grid, (IMP *)&sbc_orig_model_list_grid);
+    sbc_hook_layout_behavior("SBHIconModel", "listsIconLayoutBehaviorForFolderClass:", 3,
+                             (IMP)sbc_model_layout_behavior, (IMP *)&sbc_orig_model_layout_behavior);
+    sbc_hook_layout_behavior("SBFolder", "listsIconLayoutBehavior", 2,
+                             (IMP)sbc_folder_layout_behavior, (IMP *)&sbc_orig_folder_layout_behavior);
+    sbc_hook_layout_behavior("SBIconListModel", "iconLayoutBehavior", 2,
+                             (IMP)sbc_list_layout_behavior, (IMP *)&sbc_orig_list_layout_behavior);
+    sbc_install_direct_placement_hooks();
 }
 
 // --------------------------------------------------- launch-time instant apply
