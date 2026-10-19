@@ -14,6 +14,7 @@ static inline NSDictionary *SBTDefaultValues(void) {
             @"dockIcons": @4,
             @"homeGridEnabled": @NO,
             @"homeGridLandscapeEnabled": @NO,
+            @"freeIconPlacement": @NO,
             @"hsCols": iPad ? @5 : @4,
             @"hsRows": @6,
             @"hsColsLandscape": iPad ? @6 : @4,

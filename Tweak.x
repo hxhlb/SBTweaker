@@ -907,9 +907,20 @@ static id sbc_drag_size_class(id dragManager, id dragID) {
 // when the custom grid is on.
 #define SBC_LAYOUT_ANY_ROW_AND_COLUMN 0x3ULL
 
+// iOS 17's free icon placement ("Free Icon Placement" in the settings),
+// independent of the custom grid. iOS 18 places icons freely by itself.
+static BOOL sbc_free_icon_placement_enabled(void) {
+    NSDictionary *p = sbc_prefs();
+    return prefBool(p, @"enabled") && prefBool(p, @"freeIconPlacement");
+}
+
+// Widgets on any row and column of a custom grid. On iOS 17 this belongs to
+// free icon placement, which it was tested with.
 static BOOL sbc_free_widget_layout_enabled(void) {
     NSDictionary *p = sbc_prefs();
-    return prefBool(p, @"enabled") && prefBool(p, @"homeGridEnabled");
+    if (!prefBool(p, @"enabled") || !prefBool(p, @"homeGridEnabled")) return NO;
+    return [NSProcessInfo processInfo].operatingSystemVersion.majorVersion >= 18 ||
+           prefBool(p, @"freeIconPlacement");
 }
 
 static unsigned long long (*sbc_orig_model_layout_behavior)(id, SEL, Class) = NULL;
@@ -1047,7 +1058,7 @@ static long long sbc_model_fixed_behavior(id self, SEL _cmd, Class folderClass) 
     long long r = sbc_orig_model_fixed_behavior(self, _cmd, folderClass);
     Class rootFolderClass = objc_getClass("SBRootFolder");
     if (!r && folderClass && rootFolderClass && [folderClass isSubclassOfClass:rootFolderClass] &&
-        sbc_free_widget_layout_enabled())
+        sbc_free_icon_placement_enabled())
         r = SBC_FIXED_LOCATIONS_ON_SNAP;
     return r;
 }
@@ -1056,7 +1067,7 @@ static long long (*sbc_orig_folder_fixed_behavior)(id, SEL) = NULL;
 static long long sbc_folder_fixed_behavior(id self, SEL _cmd) {
     long long r = sbc_orig_folder_fixed_behavior(self, _cmd);
     Class rootFolderClass = objc_getClass("SBRootFolder");
-    if (!r && rootFolderClass && [self isKindOfClass:rootFolderClass] && sbc_free_widget_layout_enabled())
+    if (!r && rootFolderClass && [self isKindOfClass:rootFolderClass] && sbc_free_icon_placement_enabled())
         r = SBC_FIXED_LOCATIONS_ON_SNAP;
     return r;
 }
@@ -1064,21 +1075,21 @@ static long long sbc_folder_fixed_behavior(id self, SEL _cmd) {
 static long long (*sbc_orig_list_fixed_behavior)(id, SEL) = NULL;
 static long long sbc_list_fixed_behavior(id self, SEL _cmd) {
     long long r = sbc_orig_list_fixed_behavior(self, _cmd);
-    if (!r && sbc_list_is_root(self) && sbc_free_widget_layout_enabled())
+    if (!r && sbc_list_is_root(self) && sbc_free_icon_placement_enabled())
         r = SBC_FIXED_LOCATIONS_ON_SNAP;
     return r;
 }
 
 static BOOL (*sbc_orig_snap_allowed)(id, SEL) = NULL;
 static BOOL sbc_snap_allowed(id self, SEL _cmd) {
-    return sbc_orig_snap_allowed(self, _cmd) || sbc_free_widget_layout_enabled();
+    return sbc_orig_snap_allowed(self, _cmd) || sbc_free_icon_placement_enabled();
 }
 
 static BOOL (*sbc_orig_can_snap_in_location)(id, SEL, id) = NULL;
 static BOOL sbc_can_snap_in_location(id self, SEL _cmd, id location) {
     if (sbc_orig_can_snap_in_location(self, _cmd, location)) return YES;
     return [location isKindOfClass:[NSString class]] && [location hasPrefix:@"SBIconLocationRoot"] &&
-           sbc_free_widget_layout_enabled();
+           sbc_free_icon_placement_enabled();
 }
 
 // iOS 17 only adds the snap-to-grid placeholder options (2: insert at a fixed
@@ -1090,7 +1101,7 @@ static BOOL sbc_can_snap_in_location(id self, SEL _cmd, id location) {
 static unsigned long long (*sbc_orig_placeholder_options)(id, SEL) = NULL;
 static unsigned long long sbc_placeholder_options(id self, SEL _cmd) {
     unsigned long long r = sbc_orig_placeholder_options(self, _cmd);
-    if ((r & SBC_PLACEHOLDER_SNAP_OPTIONS) == SBC_PLACEHOLDER_SNAP_OPTIONS || !sbc_free_widget_layout_enabled())
+    if ((r & SBC_PLACEHOLDER_SNAP_OPTIONS) == SBC_PLACEHOLDER_SNAP_OPTIONS || !sbc_free_icon_placement_enabled())
         return r;
     id listView = [self respondsToSelector:@selector(listView)] ? [self performSelector:@selector(listView)] : nil;
     if (![listView respondsToSelector:@selector(iconLocation)]) return r;
@@ -1102,7 +1113,7 @@ static unsigned long long sbc_placeholder_options(id self, SEL _cmd) {
 
 static BOOL (*sbc_orig_context_snap_allowed)(id, SEL) = NULL;
 static BOOL sbc_context_snap_allowed(id self, SEL _cmd) {
-    return sbc_orig_context_snap_allowed(self, _cmd) || sbc_free_widget_layout_enabled();
+    return sbc_orig_context_snap_allowed(self, _cmd) || sbc_free_icon_placement_enabled();
 }
 
 // The drop, too, passes its snap-to-grid insertion options only for items
@@ -1118,7 +1129,7 @@ static void sbc_snap_perform_drop(id self, SEL _cmd, id drop, id identifier, id 
     NSString *location = [listView respondsToSelector:@selector(iconLocation)]
         ? [listView performSelector:@selector(iconLocation)] : nil;
     sbc_snap_drop = [location isKindOfClass:[NSString class]] && [location hasPrefix:@"SBIconLocationRoot"] &&
-                    sbc_free_widget_layout_enabled();
+                    sbc_free_icon_placement_enabled();
     sbc_orig_snap_perform_drop(self, _cmd, drop, identifier, iconIdentifiers, listView);
     sbc_snap_drop = previous;
 }
