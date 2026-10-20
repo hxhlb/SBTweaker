@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.9
+
+- Icon Scale now starts from the device's own icon size instead of a 60 pt
+  icon at 2x. On 3x iPhones such as the Pro Max models icons are no longer
+  smaller than the setting says and are drawn at full resolution; on iPad,
+  pages with widgets keep their own icon size.
+- Free Icon Placement now works on iPad (iPadOS 17): apps stay on the spot
+  they are dropped on, like widgets already did. Rotation works as before.
+- With a low Drag Coefficient, icons no longer vanish for a few seconds after
+  adding a widget. While a widget is added, animations run at normal speed;
+  the configured speed returns once edit mode is left or an app is opened,
+  but no sooner than 3 seconds after adding.
+
 ## 1.3.8
 
 - Widgets can now be placed on any row and column of a custom Home Screen

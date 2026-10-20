@@ -13,8 +13,8 @@ These are in-process Substrate-hook reimplementations of my
   independently for portrait and landscape (landscape only affects rotating
   Home Screens, i.e. iPad); on iOS 18, widgets can go on any row and column
   of the custom grid
-- **Free Icon Placement** (iOS 17): apps and widgets stay where they are
-  dropped, with gaps, like on iOS 18
+- **Free Icon Placement** (iOS 17, iPhone and iPad): apps and widgets stay
+  where they are dropped, with gaps, like on iOS 18
 - **Spacing**: independent portrait and landscape Home Screen insets, plus
   independent left and right dock spacing
 - **Icon scale**: separate Home Screen and Dock scaling; the Home value applies
@@ -47,6 +47,28 @@ These are in-process Substrate-hook reimplementations of my
 All settings live in Settings → SBTweaker. Every feature is opt-in and off by
 default; enabling the master switch alone changes nothing. Layout controls
 apply live, and a respring button is included for changes that need one.
+
+## Version 1.3.9
+
+- Icon scale scales each layout configuration's native `iconImageInfo`
+  (size and corner radius, keeping its pixel scale) instead of a 60 pt / 2x
+  baseline. The native value is kept per configuration: recorded from the
+  first read, replaced when SpringBoard sets a new one, and copied to copies
+  of the configuration; with scaling off the getter returns SpringBoard's
+  value untouched.
+- On iPad, root lists already use fixed icon location behavior 3 (widgets,
+  required for rotation); Free Icon Placement turns it into 2 (all icons,
+  still required) instead of leaving it.
+- Choosing a widget in the widget sheet
+  (`addWidgetSheetViewController:didSelectWidgetIconView:` on
+  `SBRootFolderController` and `SBHPadAddSheetViewController`) restores the
+  stock `UIAnimationDragCoefficient`. The configured value is re-applied once
+  3 s have passed and the Home Screen has left edit mode or an app is in
+  front, checked every 250 ms while the pause lasts, and after 60 s at the
+  latest. Re-applying it while the insertion flow runs leaves the page's
+  icons invisible.
+- The iOS 17 fixed-icon relocation guard and the root-list behavior hooks
+  check the settings before doing any work.
 
 ## Version 1.3.8
 
