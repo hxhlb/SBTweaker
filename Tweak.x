@@ -327,22 +327,33 @@ static void apply_dock_spacing(id dockCfg, double extraL, double extraR) {
 
 // ----------------------------------------------------- scaling (darksword_layout)
 
-// Icon geometry differs per device (e.g. 60 pt at 2x, 64 pt at 3x), so the
-// scaled value is derived from the configuration's own native icon image
-// info. Once scaling is on, configurations are written with the scaled
-// value, and widget pages use copies made from them, so the native value is
-// recorded once per kind (Home Screen, Dock) from the first read, before
-// anything is written, and used from then on. Scaling that absolute value
-// keeps repeated layout passes idempotent (no compounding).
+// Icon geometry differs per device and per layout (e.g. 60 pt at 2x, 64 pt
+// at 3x; iPad pages with widgets use smaller icons), so the scaled value is
+// derived from each configuration's own native icon image info. Once
+// scaling is on, a configuration is written with the scaled value, so its
+// native one is kept alongside it: recorded from the first read, replaced
+// whenever SpringBoard itself sets a new value, and handed on to copies.
+// Scaling that absolute value keeps repeated layout passes idempotent (no
+// compounding).
+static char sbc_native_icon_info_key;
+static BOOL sbc_writing_icon_info = NO;
+
 static BOOL sbc_icon_info_valid(SBIconImageInfo info) {
     return info.size.width > 0.0 && info.size.height > 0.0 && info.scale > 0.0;
 }
 
-static SBIconImageInfo sbc_native_icon_info(BOOL dock, SBIconImageInfo current) {
-    static SBIconImageInfo nativeRoot, nativeDock;
-    SBIconImageInfo *native = dock ? &nativeDock : &nativeRoot;
-    if (!sbc_icon_info_valid(*native) && sbc_icon_info_valid(current)) *native = current;
-    return *native;
+static void sbc_set_native_icon_info(id cfg, SBIconImageInfo info) {
+    if (!sbc_icon_info_valid(info)) return;
+    objc_setAssociatedObject(cfg, &sbc_native_icon_info_key,
+                             [NSValue valueWithBytes:&info objCType:@encode(SBIconImageInfo)],
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static BOOL sbc_get_native_icon_info(id cfg, SBIconImageInfo *info) {
+    NSValue *stored = objc_getAssociatedObject(cfg, &sbc_native_icon_info_key);
+    if (!stored) return NO;
+    [stored getValue:info size:sizeof *info];
+    return YES;
 }
 
 static SBIconImageInfo configured_icon_image_info(SBIconImageInfo native, double scale) {
@@ -564,6 +575,9 @@ static int sbc_config_kind(id cfg) {
     id copy = %orig;
     if ([sbc_root_configs() containsObject:self])
         sbc_register_root_config(copy);
+    SBIconImageInfo native;
+    if (copy && sbc_get_native_icon_info(self, &native))
+        sbc_set_native_icon_info(copy, native);
     return copy;
 }
 
@@ -628,18 +642,32 @@ static int sbc_config_kind(id cfg) {
 
 - (SBIconImageInfo)iconImageInfo {
     SBIconImageInfo orig = %orig;
-    int kind = sbc_config_kind(self);
-    if (kind != SBC_CFG_ROOT && kind != SBC_CFG_DOCK) return orig;
-    SBIconImageInfo native = sbc_native_icon_info(kind == SBC_CFG_DOCK, orig);
-    if (!sbc_icon_info_valid(native)) return orig;
+    SBIconImageInfo native;
+    BOOL known = sbc_get_native_icon_info(self, &native);
     NSDictionary *p = sbc_prefs();
-    if (!prefBool(p, @"enabled")) return native;
-    if (kind == SBC_CFG_ROOT && !prefBool(p, @"homeScaleEnabled")) return native;
-    if (kind == SBC_CFG_DOCK && !prefBool(p, @"dockScaleEnabled")) return native;
+    BOOL home = prefBool(p, @"enabled") && prefBool(p, @"homeScaleEnabled");
+    BOOL dock = prefBool(p, @"enabled") && prefBool(p, @"dockScaleEnabled");
+    // Scaling off: SpringBoard's value, or the native one if it was scaled.
+    if (!home && !dock) return known ? native : orig;
+    int kind = sbc_config_kind(self);
+    BOOL scaled = (kind == SBC_CFG_ROOT && home) || (kind == SBC_CFG_DOCK && dock);
+    if (!scaled) return known ? native : orig;
+    if (!known) {
+        if (!sbc_icon_info_valid(orig)) return orig;
+        native = orig;
+        sbc_set_native_icon_info(self, native);
+    }
     double scale = kind == SBC_CFG_DOCK ? prefDouble(p, @"dockScale")
                                         : prefDouble(p, @"homeScale");
     if (scale <= 0.0 || scale > 2.0) return native;
     return configured_icon_image_info(native, scale);
+}
+
+- (void)setIconImageInfo:(SBIconImageInfo)info {
+    // A value SpringBoard sets is the new native one; ours is the scaled one.
+    if (!sbc_writing_icon_info && objc_getAssociatedObject(self, &sbc_native_icon_info_key))
+        sbc_set_native_icon_info(self, info);
+    %orig;
 }
 %end
 %end
@@ -964,7 +992,7 @@ static unsigned long long sbc_folder_layout_behavior(id self, SEL _cmd) {
 static unsigned long long (*sbc_orig_list_layout_behavior)(id, SEL) = NULL;
 static unsigned long long sbc_list_layout_behavior(id self, SEL _cmd) {
     unsigned long long r = sbc_orig_list_layout_behavior(self, _cmd);
-    if (sbc_list_is_root(self) && sbc_free_widget_layout_enabled())
+    if (sbc_free_widget_layout_enabled() && sbc_list_is_root(self))
         r |= SBC_LAYOUT_ANY_ROW_AND_COLUMN;
     return r;
 }
@@ -1071,14 +1099,25 @@ static void sbc_install_direct_placement_hooks(void) {
 // snap-to-grid insertions; 2 always, 3 widgets only, and these two also
 // require fixed positions). iOS 18 renumbered these and uses 4.
 #define SBC_FIXED_LOCATIONS_ON_SNAP 1LL
+#define SBC_FIXED_LOCATIONS_ALWAYS 2LL
+#define SBC_FIXED_LOCATIONS_WIDGETS 3LL
+
+// iPhone root lists have no fixed positions (0) and get 1. iPad root lists
+// already keep fixed positions for widgets, required for rotation (3); they
+// get 2, which keeps them for every icon and still requires them.
+static long long sbc_free_fixed_behavior(long long behavior) {
+    if (behavior == 0) return SBC_FIXED_LOCATIONS_ON_SNAP;
+    if (behavior == SBC_FIXED_LOCATIONS_WIDGETS) return SBC_FIXED_LOCATIONS_ALWAYS;
+    return behavior;
+}
 
 static long long (*sbc_orig_model_fixed_behavior)(id, SEL, Class) = NULL;
 static long long sbc_model_fixed_behavior(id self, SEL _cmd, Class folderClass) {
     long long r = sbc_orig_model_fixed_behavior(self, _cmd, folderClass);
     Class rootFolderClass = objc_getClass("SBRootFolder");
-    if (!r && folderClass && rootFolderClass && [folderClass isSubclassOfClass:rootFolderClass] &&
+    if (folderClass && rootFolderClass && [folderClass isSubclassOfClass:rootFolderClass] &&
         sbc_free_icon_placement_enabled())
-        r = SBC_FIXED_LOCATIONS_ON_SNAP;
+        r = sbc_free_fixed_behavior(r);
     return r;
 }
 
@@ -1086,16 +1125,16 @@ static long long (*sbc_orig_folder_fixed_behavior)(id, SEL) = NULL;
 static long long sbc_folder_fixed_behavior(id self, SEL _cmd) {
     long long r = sbc_orig_folder_fixed_behavior(self, _cmd);
     Class rootFolderClass = objc_getClass("SBRootFolder");
-    if (!r && rootFolderClass && [self isKindOfClass:rootFolderClass] && sbc_free_icon_placement_enabled())
-        r = SBC_FIXED_LOCATIONS_ON_SNAP;
+    if (rootFolderClass && [self isKindOfClass:rootFolderClass] && sbc_free_icon_placement_enabled())
+        r = sbc_free_fixed_behavior(r);
     return r;
 }
 
 static long long (*sbc_orig_list_fixed_behavior)(id, SEL) = NULL;
 static long long sbc_list_fixed_behavior(id self, SEL _cmd) {
     long long r = sbc_orig_list_fixed_behavior(self, _cmd);
-    if (!r && sbc_list_is_root(self) && sbc_free_icon_placement_enabled())
-        r = SBC_FIXED_LOCATIONS_ON_SNAP;
+    if (sbc_free_icon_placement_enabled() && sbc_list_is_root(self))
+        r = sbc_free_fixed_behavior(r);
     return r;
 }
 
@@ -1169,7 +1208,7 @@ static id sbc_folder_insert_at_path(id self, SEL _cmd, id icon, id gridPath, uns
 typedef struct { unsigned long long start; SBCGridSize size; } SBCGridRange;
 static id (*sbc_orig_relocate_fixed)(id, SEL, SBCGridRange, unsigned long long) = NULL;
 static id sbc_relocate_fixed(id self, SEL _cmd, SBCGridRange range, unsigned long long options) {
-    if ([self respondsToSelector:@selector(gridCellInfoWithOptions:)]) {
+    if (sbc_free_icon_placement_enabled() && [self respondsToSelector:@selector(gridCellInfoWithOptions:)]) {
         id info = ((id (*)(id, SEL, unsigned long long))objc_msgSend)(self, @selector(gridCellInfoWithOptions:), options);
         SBCGridSize grid = [info respondsToSelector:@selector(gridSize)]
             ? ((SBCGridSize (*)(id, SEL))objc_msgSend)(info, @selector(gridSize)) : (SBCGridSize){0, 0};
@@ -1305,10 +1344,14 @@ static void sbc_patch_root_config(id cfg) {
     if (prefBool(p, @"homeScaleEnabled") &&
         homeScale > 0.0 && homeScale <= 2.0 &&
         [cfg respondsToSelector:@selector(setIconImageInfo:)] &&
-        [cfg respondsToSelector:@selector(iconImageInfo)])
+        [cfg respondsToSelector:@selector(iconImageInfo)]) {
         // The getter hook records the native value before it is overwritten
         // and already returns it scaled.
-        [cfg setIconImageInfo:[cfg iconImageInfo]];
+        SBIconImageInfo info = [cfg iconImageInfo];
+        sbc_writing_icon_info = YES;
+        [cfg setIconImageInfo:info];
+        sbc_writing_icon_info = NO;
+    }
 }
 
 static void sbc_patch_dock_config(id dock) {
@@ -1331,8 +1374,12 @@ static void sbc_patch_dock_config(id dock) {
     if (prefBool(p, @"dockScaleEnabled") &&
         dockScale > 0.0 && dockScale <= 2.0 &&
         [cfg respondsToSelector:@selector(setIconImageInfo:)] &&
-        [cfg respondsToSelector:@selector(iconImageInfo)])
-        [cfg setIconImageInfo:[cfg iconImageInfo]];
+        [cfg respondsToSelector:@selector(iconImageInfo)]) {
+        SBIconImageInfo info = [cfg iconImageInfo];
+        sbc_writing_icon_info = YES;
+        [cfg setIconImageInfo:info];
+        sbc_writing_icon_info = NO;
+    }
     [dock setNeedsLayout];
 }
 
@@ -1847,6 +1894,58 @@ static void sbc_apply_drag_coefficient(void) {
     if (v < 0.01 || v > 2.0) return;
     if (fabs(v - 1.0) < 1e-9) return; // stock — leave the global untouched
     override_drag_coefficient(v);
+}
+
+// Adding a widget runs SpringBoard animations that UIKit's coefficient scales
+// alongside steps with their own timing; with a small coefficient they get out
+// of step and the page's icons stay invisible for seconds. The stock
+// coefficient is restored while a widget is added and the configured one
+// re-applied afterwards.
+static NSUInteger sbc_drag_suspend_token = 0;
+
+static void sbc_suspend_drag_coefficient(NSTimeInterval seconds) {
+    NSDictionary *p = sbc_prefs();
+    if (!prefBool(p, @"enabled") || !prefBool(p, @"dragCoefficientEnabled")) return;
+    double v = sbc_pref_double_live(CFSTR("dragCoefficient"));
+    if (v < 0.01 || v > 2.0 || fabs(v - 1.0) < 1e-9) return;
+    NSUInteger token = ++sbc_drag_suspend_token;
+    override_drag_coefficient(1.0);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (token == sbc_drag_suspend_token) sbc_apply_drag_coefficient();
+    });
+}
+
+static void (*sbc_orig_root_add_widget)(id, SEL, id, id) = NULL;
+static void sbc_root_add_widget(id self, SEL _cmd, id sheet, id iconView) {
+    sbc_suspend_drag_coefficient(5.0);
+    sbc_orig_root_add_widget(self, _cmd, sheet, iconView);
+}
+
+static void (*sbc_orig_pad_add_widget)(id, SEL, id, id) = NULL;
+static void sbc_pad_add_widget(id self, SEL _cmd, id sheet, id iconView) {
+    sbc_suspend_drag_coefficient(5.0);
+    sbc_orig_pad_add_widget(self, _cmd, sheet, iconView);
+}
+
+static void sbc_install_add_widget_hooks(void) {
+    const char *sel = "addWidgetSheetViewController:didSelectWidgetIconView:";
+    struct { const char *cls; IMP imp; IMP *orig; } hooks[] = {
+        { "SBRootFolderController", (IMP)sbc_root_add_widget, (IMP *)&sbc_orig_root_add_widget },
+        { "SBHPadAddSheetViewController", (IMP)sbc_pad_add_widget, (IMP *)&sbc_orig_pad_add_widget },
+    };
+    for (size_t i = 0; i < sizeof hooks / sizeof hooks[0]; i++) {
+        Class cls = objc_getClass(hooks[i].cls);
+        Method m = cls ? class_getInstanceMethod(cls, sel_registerName(sel)) : NULL;
+        // Only a class's own implementation, so a subclass is not hooked twice.
+        if (!m || strcmp(method_getTypeEncoding(m), "v32@0:8@16@24") != 0) continue;
+        BOOL own = NO;
+        unsigned int count = 0;
+        Method *list = class_copyMethodList(cls, &count);
+        for (unsigned int j = 0; j < count; j++) if (list[j] == m) own = YES;
+        free(list);
+        if (own) MSHookMessageEx(cls, sel_registerName(sel), hooks[i].imp, hooks[i].orig);
+    }
 }
 
 // ------------------------------------------------ wake/sleep & icon fly-in
@@ -2621,6 +2720,7 @@ static void sbc_respring_notification(CFNotificationCenterRef center, void *obse
     %init(SpringBoard);
     sbc_install_landscape_hooks();
     sbc_install_home_layout_hooks();
+    sbc_install_add_widget_hooks();
     sbt_install_home_double_tap_hook();
     // Do not write or migrate preferences during SpringBoard construction.
     // On iOS 15, synchronous cfprefsd writes here can stall SpringBoard before
