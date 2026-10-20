@@ -1898,54 +1898,96 @@ static void sbc_apply_drag_coefficient(void) {
 
 // Adding a widget runs SpringBoard animations that UIKit's coefficient scales
 // alongside steps with their own timing; with a small coefficient they get out
-// of step and the page's icons stay invisible for seconds. The stock
-// coefficient is restored while a widget is added and the configured one
-// re-applied afterwards.
+// of step and the page's icons stay invisible for seconds. Switching back to
+// the configured coefficient while that flow still runs (2-3 s, well past the
+// widget sheet's disappearance) does the same, and there is no callback for
+// its end, and switching back while an app is in front breaks it just the
+// same (the Home Screen comes back with only the new widget). So the stock
+// coefficient is restored when a widget is chosen and the configured one
+// re-applied once the flow is over (3 s) and the Home Screen has left edit
+// mode or an app is in front, and after 60 s at the latest.
 static NSUInteger sbc_drag_suspend_token = 0;
+static BOOL sbc_drag_suspended = NO;
+static CFAbsoluteTime sbc_drag_suspended_at = 0;
+static dispatch_source_t sbc_drag_poll = NULL;
 
-static void sbc_suspend_drag_coefficient(NSTimeInterval seconds) {
+static void sbc_end_drag_suspension(void) {
+    if (!sbc_drag_suspended) return;
+    sbc_drag_suspended = NO;
+    if (sbc_drag_poll) { dispatch_source_cancel(sbc_drag_poll); sbc_drag_poll = NULL; }
+    sbc_apply_drag_coefficient();
+}
+
+static BOOL sbc_app_in_foreground(void) {
+    id app = [UIApplication sharedApplication];
+    SEL sel = NSSelectorFromString(@"_accessibilityFrontMostApplication");
+    return [app respondsToSelector:sel] && ((id (*)(id, SEL))objc_msgSend)(app, sel) != nil;
+}
+
+static BOOL sbc_home_screen_editing(void) {
+    id iconCtrl = [%c(SBIconController) sharedInstance];
+    id mgr = [iconCtrl respondsToSelector:@selector(iconManager)] ? [iconCtrl iconManager] : nil;
+    return [mgr respondsToSelector:@selector(isEditing)] && ((BOOL (*)(id, SEL))objc_msgSend)(mgr, @selector(isEditing));
+}
+
+static void sbc_check_drag_suspension(void) {
+    if (!sbc_drag_suspended) return;
+    CFAbsoluteTime elapsed = CFAbsoluteTimeGetCurrent() - sbc_drag_suspended_at;
+    if (elapsed >= 60.0 || (elapsed >= 3.0 && (sbc_app_in_foreground() || !sbc_home_screen_editing())))
+        sbc_end_drag_suspension();
+}
+
+static void sbc_suspend_drag_coefficient(void) {
     NSDictionary *p = sbc_prefs();
     if (!prefBool(p, @"enabled") || !prefBool(p, @"dragCoefficientEnabled")) return;
     double v = sbc_pref_double_live(CFSTR("dragCoefficient"));
     if (v < 0.01 || v > 2.0 || fabs(v - 1.0) < 1e-9) return;
-    NSUInteger token = ++sbc_drag_suspend_token;
+    ++sbc_drag_suspend_token;
+    sbc_drag_suspended = YES;
+    sbc_drag_suspended_at = CFAbsoluteTimeGetCurrent();
     override_drag_coefficient(1.0);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (token == sbc_drag_suspend_token) sbc_apply_drag_coefficient();
-    });
+    if (!sbc_drag_poll) {
+        sbc_drag_poll = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(sbc_drag_poll, dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                                  250 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(sbc_drag_poll, ^{ sbc_check_drag_suspension(); });
+        dispatch_resume(sbc_drag_poll);
+    }
 }
 
 static void (*sbc_orig_root_add_widget)(id, SEL, id, id) = NULL;
 static void sbc_root_add_widget(id self, SEL _cmd, id sheet, id iconView) {
-    sbc_suspend_drag_coefficient(5.0);
+    sbc_suspend_drag_coefficient();
     sbc_orig_root_add_widget(self, _cmd, sheet, iconView);
 }
 
 static void (*sbc_orig_pad_add_widget)(id, SEL, id, id) = NULL;
 static void sbc_pad_add_widget(id self, SEL _cmd, id sheet, id iconView) {
-    sbc_suspend_drag_coefficient(5.0);
+    sbc_suspend_drag_coefficient();
     sbc_orig_pad_add_widget(self, _cmd, sheet, iconView);
 }
 
+// Hooks a class's own implementation only, so a subclass is not hooked twice.
+static void sbc_hook_own(const char *className, const char *selName, const char *encoding,
+                         IMP replacement, IMP *original) {
+    Class cls = objc_getClass(className);
+    SEL sel = sel_registerName(selName);
+    Method m = cls ? class_getInstanceMethod(cls, sel) : NULL;
+    if (!m || strcmp(method_getTypeEncoding(m), encoding) != 0) return;
+    BOOL own = NO;
+    unsigned int count = 0;
+    Method *list = class_copyMethodList(cls, &count);
+    for (unsigned int j = 0; j < count; j++) if (list[j] == m) own = YES;
+    free(list);
+    if (own) MSHookMessageEx(cls, sel, replacement, original);
+}
+
 static void sbc_install_add_widget_hooks(void) {
-    const char *sel = "addWidgetSheetViewController:didSelectWidgetIconView:";
-    struct { const char *cls; IMP imp; IMP *orig; } hooks[] = {
-        { "SBRootFolderController", (IMP)sbc_root_add_widget, (IMP *)&sbc_orig_root_add_widget },
-        { "SBHPadAddSheetViewController", (IMP)sbc_pad_add_widget, (IMP *)&sbc_orig_pad_add_widget },
-    };
-    for (size_t i = 0; i < sizeof hooks / sizeof hooks[0]; i++) {
-        Class cls = objc_getClass(hooks[i].cls);
-        Method m = cls ? class_getInstanceMethod(cls, sel_registerName(sel)) : NULL;
-        // Only a class's own implementation, so a subclass is not hooked twice.
-        if (!m || strcmp(method_getTypeEncoding(m), "v32@0:8@16@24") != 0) continue;
-        BOOL own = NO;
-        unsigned int count = 0;
-        Method *list = class_copyMethodList(cls, &count);
-        for (unsigned int j = 0; j < count; j++) if (list[j] == m) own = YES;
-        free(list);
-        if (own) MSHookMessageEx(cls, sel_registerName(sel), hooks[i].imp, hooks[i].orig);
-    }
+    const char *chosen = "addWidgetSheetViewController:didSelectWidgetIconView:";
+    sbc_hook_own("SBRootFolderController", chosen, "v32@0:8@16@24",
+                 (IMP)sbc_root_add_widget, (IMP *)&sbc_orig_root_add_widget);
+    sbc_hook_own("SBHPadAddSheetViewController", chosen, "v32@0:8@16@24",
+                 (IMP)sbc_pad_add_widget, (IMP *)&sbc_orig_pad_add_widget);
 }
 
 // ------------------------------------------------ wake/sleep & icon fly-in
