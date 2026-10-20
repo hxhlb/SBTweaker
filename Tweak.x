@@ -327,13 +327,28 @@ static void apply_dock_spacing(id dockCfg, double extraL, double extraR) {
 
 // ----------------------------------------------------- scaling (darksword_layout)
 
-static SBIconImageInfo configured_icon_image_info(double scale) {
-    // SpringBoard's iOS 15–17 application-icon baseline. Returning/writing an
-    // absolute value makes repeated layout passes idempotent (no compounding).
-    SBIconImageInfo info;
-    info.size = CGSizeMake(60.0 * scale, 60.0 * scale);
-    info.scale = 2.0;
-    info.continuousCornerRadius = 13.5 * scale;
+// Icon geometry differs per device (e.g. 60 pt at 2x, 64 pt at 3x), so the
+// scaled value is derived from the configuration's own native icon image
+// info. Once scaling is on, configurations are written with the scaled
+// value, and widget pages use copies made from them, so the native value is
+// recorded once per kind (Home Screen, Dock) from the first read, before
+// anything is written, and used from then on. Scaling that absolute value
+// keeps repeated layout passes idempotent (no compounding).
+static BOOL sbc_icon_info_valid(SBIconImageInfo info) {
+    return info.size.width > 0.0 && info.size.height > 0.0 && info.scale > 0.0;
+}
+
+static SBIconImageInfo sbc_native_icon_info(BOOL dock, SBIconImageInfo current) {
+    static SBIconImageInfo nativeRoot, nativeDock;
+    SBIconImageInfo *native = dock ? &nativeDock : &nativeRoot;
+    if (!sbc_icon_info_valid(*native) && sbc_icon_info_valid(current)) *native = current;
+    return *native;
+}
+
+static SBIconImageInfo configured_icon_image_info(SBIconImageInfo native, double scale) {
+    SBIconImageInfo info = native;
+    info.size = CGSizeMake(native.size.width * scale, native.size.height * scale);
+    info.continuousCornerRadius = native.continuousCornerRadius * scale;
     return info;
 }
 
@@ -360,7 +375,7 @@ static UIEdgeInsets constrained_grid_insets(UIEdgeInsets insets, int columns,
     return insets;
 }
 
-// SBApplicationIcon only — widgets/folders assert on forced 60x60.
+// SBApplicationIcon only — widgets/folders assert on a forced app icon size.
 static void refresh_list_view_icons(id listView, SBIconImageInfo info) {
     Class iconViewClass = %c(SBIconView);
     Class appIconClass = %c(SBApplicationIcon);
@@ -613,16 +628,18 @@ static int sbc_config_kind(id cfg) {
 
 - (SBIconImageInfo)iconImageInfo {
     SBIconImageInfo orig = %orig;
-    NSDictionary *p = sbc_prefs();
-    if (!prefBool(p, @"enabled")) return orig;
     int kind = sbc_config_kind(self);
     if (kind != SBC_CFG_ROOT && kind != SBC_CFG_DOCK) return orig;
-    if (kind == SBC_CFG_ROOT && !prefBool(p, @"homeScaleEnabled")) return orig;
-    if (kind == SBC_CFG_DOCK && !prefBool(p, @"dockScaleEnabled")) return orig;
+    SBIconImageInfo native = sbc_native_icon_info(kind == SBC_CFG_DOCK, orig);
+    if (!sbc_icon_info_valid(native)) return orig;
+    NSDictionary *p = sbc_prefs();
+    if (!prefBool(p, @"enabled")) return native;
+    if (kind == SBC_CFG_ROOT && !prefBool(p, @"homeScaleEnabled")) return native;
+    if (kind == SBC_CFG_DOCK && !prefBool(p, @"dockScaleEnabled")) return native;
     double scale = kind == SBC_CFG_DOCK ? prefDouble(p, @"dockScale")
                                         : prefDouble(p, @"homeScale");
-    if (scale <= 0.0 || scale > 2.0) return orig;
-    return configured_icon_image_info(scale);
+    if (scale <= 0.0 || scale > 2.0) return native;
+    return configured_icon_image_info(native, scale);
 }
 %end
 %end
@@ -745,7 +762,9 @@ static SBIconImageInfo sbc_landscape_icon_info(id self, SEL _cmd) {
         sbc_config_kind(self) != SBC_CFG_ROOT)
         return orig;
     double scale = prefDouble(p, @"homeScale");
-    return scale > 0.0 && scale <= 2.0 ? configured_icon_image_info(scale) : orig;
+    // Nothing writes the landscape value, so the original is the native one.
+    if (!sbc_icon_info_valid(orig) || scale <= 0.0 || scale > 2.0) return orig;
+    return configured_icon_image_info(orig, scale);
 }
 
 static void sbc_install_landscape_hooks(void) {
@@ -1285,8 +1304,11 @@ static void sbc_patch_root_config(id cfg) {
                                                     100.0 + exB, 27.0 + exR)];
     if (prefBool(p, @"homeScaleEnabled") &&
         homeScale > 0.0 && homeScale <= 2.0 &&
-        [cfg respondsToSelector:@selector(setIconImageInfo:)])
-        [cfg setIconImageInfo:configured_icon_image_info(homeScale)];
+        [cfg respondsToSelector:@selector(setIconImageInfo:)] &&
+        [cfg respondsToSelector:@selector(iconImageInfo)])
+        // The getter hook records the native value before it is overwritten
+        // and already returns it scaled.
+        [cfg setIconImageInfo:[cfg iconImageInfo]];
 }
 
 static void sbc_patch_dock_config(id dock) {
@@ -1308,8 +1330,9 @@ static void sbc_patch_dock_config(id dock) {
                                                     0.0, 16.0 + dockExR)];
     if (prefBool(p, @"dockScaleEnabled") &&
         dockScale > 0.0 && dockScale <= 2.0 &&
-        [cfg respondsToSelector:@selector(setIconImageInfo:)])
-        [cfg setIconImageInfo:configured_icon_image_info(dockScale)];
+        [cfg respondsToSelector:@selector(setIconImageInfo:)] &&
+        [cfg respondsToSelector:@selector(iconImageInfo)])
+        [cfg setIconImageInfo:[cfg iconImageInfo]];
     [dock setNeedsLayout];
 }
 
